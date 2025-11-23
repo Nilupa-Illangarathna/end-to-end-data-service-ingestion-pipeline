@@ -1,7 +1,7 @@
+// src/routes/news.js
 const express = require("express");
 const dayjs = require("dayjs");
 const { faker } = require("@faker-js/faker");
-const random = require("../utils/random");
 const topics = require("../data/topics");
 const authors = require("../data/authors");
 const tickers = require("../data/tickers");
@@ -12,124 +12,278 @@ const path = require("path");
 
 const router = express.Router();
 
-// Excel file location
-const EXCEL_PATH = path.join(__dirname, "..", "logs", "news_history.xlsx");
+// =======================================
+// Config
+// =======================================
+
+const LOGS_DIR = path.join(__dirname, "..", "logs");
+const STEP_MINUTES = 1;
 
 // Ensure logs folder exists
-const LOGS_DIR = path.join(__dirname, "..", "logs");
 if (!fs.existsSync(LOGS_DIR)) {
-    fs.mkdirSync(LOGS_DIR);
+  fs.mkdirSync(LOGS_DIR);
 }
 
-/**
- * Append rows to Excel
- */
-function appendToExcel(rows) {
-    let workbook;
-    let worksheet;
+// =======================================
+// Deterministic helpers
+// =======================================
 
-    if (fs.existsSync(EXCEL_PATH)) {
-        workbook = XLSX.readFile(EXCEL_PATH);
-        worksheet = workbook.Sheets["News"] || XLSX.utils.aoa_to_sheet([]);
-    } else {
-        workbook = XLSX.utils.book_new();
-        worksheet = XLSX.utils.aoa_to_sheet([]);
-    }
-
-    // Convert sheet to JSON for easier appending
-    let existing = XLSX.utils.sheet_to_json(worksheet, { defval: "" });
-
-    // Append new rows
-    const updated = existing.concat(rows);
-
-    // Convert JSON back to sheet
-    const newSheet = XLSX.utils.json_to_sheet(updated);
-
-    workbook.Sheets["News"] = newSheet;
-    workbook.SheetNames = ["News"];
-
-    XLSX.writeFile(workbook, EXCEL_PATH);
+// Strong deterministic hash (non-crypto)
+function hashString(str) {
+  let h = 2166136261 >>> 0;
+  for (let i = 0; i < str.length; i++) {
+    h ^= str.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+    h >>>= 0;
+  }
+  return h >>> 0;
 }
 
-/**
- * GET /news?start=ISO&end=ISO
- *
- * Generates realistic news items between start and end timestamps.
- */
-router.get("/", (req, res) => {
-    const { start, end } = req.query;
+// Always choose valid index, NEVER undefined
+function pickDet(arr, baseSeed, salt = 0) {
+  if (!arr.length) return null;
+  return arr[(baseSeed + salt) % arr.length];
+}
 
-    if (!start || !end) {
-        return res.status(400).json({ error: "start and end query params required" });
-    }
+// =======================================
+// XLSX helpers
+// =======================================
 
-    const startTime = dayjs(start);
-    const endTime = dayjs(end);
+function getYearFilePath(year) {
+  return path.join(LOGS_DIR, `news_${year}.xlsx`);
+}
 
-    if (!startTime.isValid() || !endTime.isValid()) {
-        return res.status(400).json({ error: "Invalid start/end timestamp" });
-    }
+function normalizeRow(row) {
+  return {
+    title: row.title || "",
+    summary: row.summary || "",
+    content: row.content || "",
+    url: row.url || "",
+    image_url: row.image_url || null,
+    source: row.source || "mock-news-api",
+    publisher: row.publisher || "",
+    authors: row.authors
+      ? String(row.authors)
+          .split(",")
+          .map((a) => a.trim())
+          .filter(Boolean)
+      : [],
+    tickers: row.tickers
+      ? String(row.tickers)
+          .split(",")
+          .map((t) => t.trim())
+          .filter(Boolean)
+      : [],
+    category: row.category || "",
+    sentiment: row.sentiment || "neutral",
+    published_at: row.published_at,
+    raw: null,
+  };
+}
 
-    if (endTime.isBefore(startTime)) {
-        return res.status(400).json({ error: "end must be >= start" });
-    }
+function loadAllRows() {
+  if (!fs.existsSync(LOGS_DIR)) return [];
 
-    const durationMinutes = endTime.diff(startTime, "minute");
+  const files = fs
+    .readdirSync(LOGS_DIR)
+    .filter((f) => /^news_\d{4}\.xlsx$/.test(f));
 
-    const articleCount = random.int(5, 20); // Avg. 5–20 articles per hour
-    let articles = [];
+  let all = [];
 
-    for (let i = 0; i < articleCount; i++) {
-        const randomTime = startTime.add(random.int(0, durationMinutes), "minute");
+  for (const file of files) {
+    const book = XLSX.readFile(path.join(LOGS_DIR, file));
+    const sheet = book.Sheets["News"];
+    if (!sheet) continue;
 
-        const topic = random.pick(topics);
-        const subtopic = random.pick(topic.subtopics);
+    const rows = XLSX.utils.sheet_to_json(sheet, { defval: "" });
+    rows.forEach((r) => all.push(normalizeRow(r)));
+  }
 
-        const title = subtopic.template.replace("{ENTITY}", random.pick(topic.entities));
-        const summary = faker.lorem.sentences(2);
+  all.sort(
+    (a, b) =>
+      new Date(a.published_at).getTime() -
+      new Date(b.published_at).getTime()
+  );
 
-        const article = {
-            title,
-            summary,
-            content: faker.lorem.paragraphs(random.int(1, 4)),
-            url: faker.internet.url(),
-            image_url: random.chance(0.7) ? faker.image.url() : null,
-            source: "mock-news-api",
-            publisher: random.pick(["Reuters", "Bloomberg", "CNN", "BBC", "NYTimes"]),
-            authors: random.chance(0.3) ? [] : [random.pick(authors)],
-            tickers: random.pickMulti(tickers, random.int(1, 3)),
-            category: random.pick(categories),
-            sentiment: random.pick(["positive", "neutral", "negative"]),
-            published_at: randomTime.toISOString(),
-            raw: null,
-        };
+  return all;
+}
 
-        articles.push(article);
-    }
+function saveAllRows(rows) {
+  if (!rows.length) return;
 
-    // Prepare rows for Excel logging
-    const excelRows = articles.map(a => ({
-        published_at: a.published_at,
-        title: a.title,
-        summary: a.summary,
-        url: a.url,
-        image_url: a.image_url,
-        source: a.source,
-        publisher: a.publisher,
-        authors: a.authors.join(", "),
-        tickers: a.tickers.join(", "),
-        category: a.category,
-        sentiment: a.sentiment,
+  const byYear = {};
+  for (const r of rows) {
+    const y = dayjs(r.published_at).year();
+    if (!byYear[y]) byYear[y] = [];
+    byYear[y].push(r);
+  }
+
+  for (const [yearStr, yearRows] of Object.entries(byYear)) {
+    yearRows.sort(
+      (a, b) =>
+        new Date(a.published_at) - new Date(b.published_at)
+    );
+
+    const excelRows = yearRows.map((r) => ({
+      published_at: r.published_at,
+      title: r.title,
+      summary: r.summary,
+      content: r.content,
+      url: r.url,
+      image_url: r.image_url,
+      source: r.source,
+      publisher: r.publisher,
+      authors: r.authors.join(", "),
+      tickers: r.tickers.join(", "),
+      category: r.category,
+      sentiment: r.sentiment,
     }));
 
-    appendToExcel(excelRows);
+    const book = XLSX.utils.book_new();
+    const sheet = XLSX.utils.json_to_sheet(excelRows);
+    book.Sheets["News"] = sheet;
+    book.SheetNames = ["News"];
+    XLSX.writeFile(book, getYearFilePath(Number(yearStr)));
+  }
+}
 
-    res.json({
-        start,
-        end,
-        count: articles.length,
-        articles,
-    });
+// =======================================
+// Deterministic Article Generator
+// =======================================
+
+function generateArticleAtTime(instant) {
+  const published_at = instant.toISOString();
+  const seed = hashString(published_at);
+
+  faker.seed(seed);
+
+  const topic = pickDet(topics, seed, 11);
+  const sub = pickDet(topic.subtopics, seed, 111);
+  const entity = pickDet(topic.entities, seed, 222);
+
+  const title = sub.template.replace("{ENTITY}", entity);
+
+  const summary = faker.lorem.sentences(2);
+  const content = faker.lorem.paragraphs(((seed >> 7) % 3) + 1);
+
+  const publisherList = ["Reuters", "Bloomberg", "CNN", "BBC", "NYTimes"];
+  const publisher = pickDet(publisherList, seed, 333);
+
+  const noAuthor = ((seed >> 11) % 4) === 0;
+  const articleAuthors = noAuthor ? [] : [pickDet(authors, seed, 444)];
+
+  const tickerCount = ((seed >> 15) % 3) + 1;
+  const articleTickers = [];
+  for (let i = 0; i < tickerCount; i++) {
+    articleTickers.push(pickDet(tickers, seed, 555 + i));
+  }
+
+  const category = pickDet(categories, seed, 666);
+  const sentiments = ["positive", "neutral", "negative"];
+  const sentiment = pickDet(sentiments, seed, 777);
+
+  const hasImage = ((seed >> 21) % 3) !== 0;
+  const image_url = hasImage ? faker.image.url() : null;
+
+  return {
+    title,
+    summary,
+    content,
+    url: faker.internet.url(),
+    image_url,
+    source: "mock-news-api",
+    publisher,
+    authors: articleAuthors,
+    tickers: articleTickers,
+    category,
+    sentiment,
+    published_at,
+    raw: null,
+  };
+}
+
+function generateArticlesForRange(from, to) {
+  let arr = [];
+  let cursor = from.startOf("minute");
+  const endExclusive = to.startOf("minute");
+
+  while (cursor.isBefore(endExclusive)) {
+    arr.push(generateArticleAtTime(cursor));
+    cursor = cursor.add(STEP_MINUTES, "minute");
+  }
+  return arr;
+}
+
+// =======================================
+// GET /news
+// =======================================
+
+router.get("/", (req, res) => {
+  const { start, end } = req.query;
+  if (!start || !end)
+    return res.status(400).json({ error: "start & end required" });
+
+  let startTime = dayjs(start).startOf("minute");
+  let endTime = dayjs(end).startOf("minute");
+
+  if (!startTime.isValid() || !endTime.isValid())
+    return res.status(400).json({ error: "Invalid timestamps" });
+
+  if (!endTime.isAfter(startTime))
+    return res.status(400).json({ error: "end must be > start" });
+
+  let rows = loadAllRows();
+
+  const generationRanges = [];
+
+  if (rows.length === 0) {
+    generationRanges.push({ from: startTime, to: endTime });
+  } else {
+    const first = dayjs(rows[0].published_at).startOf("minute");
+    const last = dayjs(rows[rows.length - 1].published_at).startOf("minute");
+    const coverageEnd = last.add(STEP_MINUTES, "minute");
+
+    if (endTime.isBefore(first) || endTime.isSame(first)) {
+      generationRanges.push({ from: startTime, to: first });
+    } else if (startTime.isAfter(coverageEnd)) {
+      generationRanges.push({ from: coverageEnd, to: endTime });
+    } else {
+      if (startTime.isBefore(first))
+        generationRanges.push({ from: startTime, to: first });
+
+      if (endTime.isAfter(coverageEnd))
+        generationRanges.push({ from: coverageEnd, to: endTime });
+    }
+  }
+
+  let newArticles = [];
+  for (const r of generationRanges) {
+    newArticles = newArticles.concat(
+      generateArticlesForRange(r.from, r.to)
+    );
+  }
+
+  if (newArticles.length > 0) {
+    rows = rows.concat(newArticles);
+    rows.sort(
+      (a, b) =>
+        new Date(a.published_at) -
+        new Date(b.published_at)
+    );
+    saveAllRows(rows);
+  }
+
+  const filtered = rows.filter((a) => {
+    const t = dayjs(a.published_at);
+    return (t.isSame(startTime) || t.isAfter(startTime)) && t.isBefore(endTime);
+  });
+
+  return res.json({
+    start,
+    end,
+    count: filtered.length,
+    articles: filtered,
+  });
 });
 
 module.exports = router;
