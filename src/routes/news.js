@@ -203,16 +203,25 @@ function generateArticleAtTime(instant) {
 }
 
 function generateArticlesForRange(from, to) {
-  let arr = [];
+  let articles = [];
+  
   let cursor = from.startOf("minute");
   const endExclusive = to.startOf("minute");
 
   while (cursor.isBefore(endExclusive)) {
-    arr.push(generateArticleAtTime(cursor));
-    cursor = cursor.add(STEP_MINUTES, "minute");
+    // generate 1 article at this minute
+    articles.push(generateArticleAtTime(cursor));
+
+    // deterministically pick next interval (1–60 minutes)
+    const seed = hashString(cursor.toISOString());
+    const intervalMinutes = (seed % 60) + 1; // 1 to 60 minutes
+
+    cursor = cursor.add(intervalMinutes, "minute");
   }
-  return arr;
+
+  return articles;
 }
+
 
 // =======================================
 // GET /news
@@ -241,7 +250,11 @@ router.get("/", (req, res) => {
   } else {
     const first = dayjs(rows[0].published_at).startOf("minute");
     const last = dayjs(rows[rows.length - 1].published_at).startOf("minute");
-    const coverageEnd = last.add(STEP_MINUTES, "minute");
+
+    // Compute deterministic next timestamp after last article
+    const lastSeed = hashString(last.toISOString());
+    const lastInterval = (lastSeed % 60) + 1;   // 1–60 minutes
+    const coverageEnd = last.add(lastInterval, "minute");
 
     if (endTime.isBefore(first) || endTime.isSame(first)) {
       generationRanges.push({ from: startTime, to: first });
