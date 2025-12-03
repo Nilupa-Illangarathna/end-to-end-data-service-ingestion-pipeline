@@ -40,3 +40,6 @@ Thumbs.db
 # ============================
 *.tmp
 *.cache
+
+
+check_code_base.sh

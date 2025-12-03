@@ -17,7 +17,7 @@ const router = express.Router();
 // =======================================
 
 const LOGS_DIR = path.join(__dirname, "..", "logs");
-const STEP_MINUTES = 1;
+const STORAGE_FILE = path.join(LOGS_DIR, "news.xlsx");
 
 // Ensure logs folder exists
 if (!fs.existsSync(LOGS_DIR)) {
@@ -46,12 +46,8 @@ function pickDet(arr, baseSeed, salt = 0) {
 }
 
 // =======================================
-// XLSX helpers
+// XLSX storage helpers
 // =======================================
-
-function getYearFilePath(year) {
-  return path.join(LOGS_DIR, `news_${year}.xlsx`);
-}
 
 function normalizeRow(row) {
   return {
@@ -82,27 +78,18 @@ function normalizeRow(row) {
 }
 
 function loadAllRows() {
-  if (!fs.existsSync(LOGS_DIR)) return [];
+  if (!fs.existsSync(STORAGE_FILE)) return [];
 
-  const files = fs
-    .readdirSync(LOGS_DIR)
-    .filter((f) => /^news_\d{4}\.xlsx$/.test(f));
+  const book = XLSX.readFile(STORAGE_FILE);
+  const sheet = book.Sheets["News"];
+  if (!sheet) return [];
 
-  let all = [];
-
-  for (const file of files) {
-    const book = XLSX.readFile(path.join(LOGS_DIR, file));
-    const sheet = book.Sheets["News"];
-    if (!sheet) continue;
-
-    const rows = XLSX.utils.sheet_to_json(sheet, { defval: "" });
-    rows.forEach((r) => all.push(normalizeRow(r)));
-  }
+  const rows = XLSX.utils.sheet_to_json(sheet, { defval: "" });
+  const all = rows.map(normalizeRow);
 
   all.sort(
     (a, b) =>
-      new Date(a.published_at).getTime() -
-      new Date(b.published_at).getTime()
+      new Date(a.published_at) - new Date(b.published_at)
   );
 
   return all;
@@ -111,40 +98,31 @@ function loadAllRows() {
 function saveAllRows(rows) {
   if (!rows.length) return;
 
-  const byYear = {};
-  for (const r of rows) {
-    const y = dayjs(r.published_at).year();
-    if (!byYear[y]) byYear[y] = [];
-    byYear[y].push(r);
-  }
+  rows.sort(
+    (a, b) => new Date(a.published_at) - new Date(b.published_at)
+  );
 
-  for (const [yearStr, yearRows] of Object.entries(byYear)) {
-    yearRows.sort(
-      (a, b) =>
-        new Date(a.published_at) - new Date(b.published_at)
-    );
+  const excelRows = rows.map((r) => ({
+    published_at: r.published_at,
+    title: r.title,
+    summary: r.summary,
+    content: r.content,
+    url: r.url,
+    image_url: r.image_url,
+    source: r.source,
+    publisher: r.publisher,
+    authors: r.authors.join(", "),
+    tickers: r.tickers.join(", "),
+    category: r.category,
+    sentiment: r.sentiment,
+  }));
 
-    const excelRows = yearRows.map((r) => ({
-      published_at: r.published_at,
-      title: r.title,
-      summary: r.summary,
-      content: r.content,
-      url: r.url,
-      image_url: r.image_url,
-      source: r.source,
-      publisher: r.publisher,
-      authors: r.authors.join(", "),
-      tickers: r.tickers.join(", "),
-      category: r.category,
-      sentiment: r.sentiment,
-    }));
+  const book = XLSX.utils.book_new();
+  const sheet = XLSX.utils.json_to_sheet(excelRows);
+  book.Sheets["News"] = sheet;
+  book.SheetNames = ["News"];
 
-    const book = XLSX.utils.book_new();
-    const sheet = XLSX.utils.json_to_sheet(excelRows);
-    book.Sheets["News"] = sheet;
-    book.SheetNames = ["News"];
-    XLSX.writeFile(book, getYearFilePath(Number(yearStr)));
-  }
+  XLSX.writeFile(book, STORAGE_FILE);
 }
 
 // =======================================
@@ -204,24 +182,21 @@ function generateArticleAtTime(instant) {
 
 function generateArticlesForRange(from, to) {
   let articles = [];
-  
-  let cursor = from.startOf("minute");
-  const endExclusive = to.startOf("minute");
+
+  let cursor = from;
+  const endExclusive = to;
 
   while (cursor.isBefore(endExclusive)) {
-    // generate 1 article at this minute
     articles.push(generateArticleAtTime(cursor));
 
-    // deterministically pick next interval (1–60 minutes)
     const seed = hashString(cursor.toISOString());
-    const intervalMinutes = (seed % 60) + 1; // 1 to 60 minutes
+    const intervalSeconds = (seed % 5) + 1;
 
-    cursor = cursor.add(intervalMinutes, "minute");
+    cursor = cursor.add(intervalSeconds, "second");
   }
 
   return articles;
 }
-
 
 // =======================================
 // GET /news
@@ -232,8 +207,8 @@ router.get("/", (req, res) => {
   if (!start || !end)
     return res.status(400).json({ error: "start & end required" });
 
-  let startTime = dayjs(start).startOf("minute");
-  let endTime = dayjs(end).startOf("minute");
+  let startTime = dayjs(start);
+  let endTime = dayjs(end);
 
   if (!startTime.isValid() || !endTime.isValid())
     return res.status(400).json({ error: "Invalid timestamps" });
@@ -248,13 +223,12 @@ router.get("/", (req, res) => {
   if (rows.length === 0) {
     generationRanges.push({ from: startTime, to: endTime });
   } else {
-    const first = dayjs(rows[0].published_at).startOf("minute");
-    const last = dayjs(rows[rows.length - 1].published_at).startOf("minute");
+    const first = dayjs(rows[0].published_at);
+    const last = dayjs(rows[rows.length - 1].published_at);
 
-    // Compute deterministic next timestamp after last article
     const lastSeed = hashString(last.toISOString());
-    const lastInterval = (lastSeed % 60) + 1;   // 1–60 minutes
-    const coverageEnd = last.add(lastInterval, "minute");
+    const lastInterval = (lastSeed % 5) + 1;
+    const coverageEnd = last.add(lastInterval, "second");
 
     if (endTime.isBefore(first) || endTime.isSame(first)) {
       generationRanges.push({ from: startTime, to: first });
@@ -280,15 +254,17 @@ router.get("/", (req, res) => {
     rows = rows.concat(newArticles);
     rows.sort(
       (a, b) =>
-        new Date(a.published_at) -
-        new Date(b.published_at)
+        new Date(a.published_at) - new Date(b.published_at)
     );
     saveAllRows(rows);
   }
 
   const filtered = rows.filter((a) => {
     const t = dayjs(a.published_at);
-    return (t.isSame(startTime) || t.isAfter(startTime)) && t.isBefore(endTime);
+    return (
+      (t.isSame(startTime) || t.isAfter(startTime)) &&
+      t.isBefore(endTime)
+    );
   });
 
   return res.json({
